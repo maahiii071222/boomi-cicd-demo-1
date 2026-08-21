@@ -1,630 +1,163 @@
-name: Boomi CI-CD Demo
+name: Deploy Boomi Processes
 
 on:
-  workflow_dispatch:
-
   push:
     branches:
       - main
-    paths:
-      - "deploy/deployment-manifest.json"
+
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: boomi-test-cicd
-  cancel-in-progress: false
-
 jobs:
-  boomi-cicd:
-    name: Package Deploy Execute
+  deploy-boomi:
+    name: Deploy Changed Boomi Processes
     runs-on: ubuntu-latest
-
-    env:
-      BOOMI_API_BASE_URL: ${{ secrets.BOOMI_API_BASE_URL }}
-      BOOMI_ACCOUNT_ID: ${{ secrets.BOOMI_ACCOUNT_ID }}
-      BOOMI_USERNAME: ${{ secrets.BOOMI_USERNAME }}
-      BOOMI_API_TOKEN: ${{ secrets.BOOMI_API_TOKEN }}
-      BOOMI_COMPONENT_ID: ${{ secrets.BOOMI_COMPONENT_ID }}
-      BOOMI_ENVIRONMENT_ID: ${{ secrets.BOOMI_ENVIRONMENT_ID }}
-      BOOMI_ATOM_ID: ${{ secrets.BOOMI_ATOM_ID }}
 
     steps:
 
       - name: Checkout Repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
-      - name: Validate GitHub Secrets and Manifest
-        shell: bash
+      - name: Find Changed Boomi Processes
+        id: changed
         run: |
-          set -euo pipefail
+          set -e
 
-          echo "=========================================="
-          echo "STEP 1 - Validate configuration"
-          echo "=========================================="
+          echo "Detecting changed Boomi processes..."
 
-          REQUIRED_VARIABLES=(
-            BOOMI_API_BASE_URL
-            BOOMI_ACCOUNT_ID
-            BOOMI_USERNAME
-            BOOMI_API_TOKEN
-            BOOMI_COMPONENT_ID
-            BOOMI_ENVIRONMENT_ID
-            BOOMI_ATOM_ID
-          )
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            find boomi-components \
+              -mindepth 2 \
+              -maxdepth 2 \
+              -type f \
+              -name "process.xml" \
+              -printf '%h\n' \
+              | sort -u \
+              > changed-processes.txt
+          else
+            git diff \
+              --name-only \
+              HEAD^ HEAD \
+              -- 'boomi-components/*/process.xml' \
+              > changed-files.txt
 
-          for VARIABLE_NAME in "${REQUIRED_VARIABLES[@]}"; do
-            if [[ -z "${!VARIABLE_NAME:-}" ]]; then
-              echo "ERROR: ${VARIABLE_NAME} is missing."
-              exit 1
+            if [ ! -s changed-files.txt ]; then
+              echo "No Boomi process changes found."
+              exit 0
             fi
-          done
 
-          if [[ ! -f "deploy/deployment-manifest.json" ]]; then
-            echo "ERROR: deploy/deployment-manifest.json does not exist."
-            exit 1
-          fi
-
-          if ! jq -e . deploy/deployment-manifest.json >/dev/null 2>&1; then
-            echo "ERROR: deployment-manifest.json is not valid JSON."
-            exit 1
-          fi
-
-          RELEASE="$(jq -r '.release // empty' deploy/deployment-manifest.json)"
-          PROCESS_NAME="$(jq -r '.process // empty' deploy/deployment-manifest.json)"
-          DESCRIPTION="$(jq -r '.description // empty' deploy/deployment-manifest.json)"
-
-          if [[ -z "${RELEASE}" ]]; then
-            echo "ERROR: release is missing."
-            exit 1
-          fi
-
-          if [[ -z "${PROCESS_NAME}" ]]; then
-            echo "ERROR: process is missing."
-            exit 1
-          fi
-
-          API_ROOT="${BOOMI_API_BASE_URL%/}/api/rest/v1/${BOOMI_ACCOUNT_ID}"
-          PACKAGE_VERSION="${RELEASE}-GHA-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
-
-          echo "RELEASE=${RELEASE}" >> "${GITHUB_ENV}"
-          echo "PROCESS_NAME=${PROCESS_NAME}" >> "${GITHUB_ENV}"
-          echo "DESCRIPTION=${DESCRIPTION}" >> "${GITHUB_ENV}"
-          echo "API_ROOT=${API_ROOT}" >> "${GITHUB_ENV}"
-          echo "PACKAGE_VERSION=${PACKAGE_VERSION}" >> "${GITHUB_ENV}"
-
-          echo "Configuration validation successful."
-          echo "Process         : ${PROCESS_NAME}"
-          echo "Release         : ${RELEASE}"
-          echo "Package Version : ${PACKAGE_VERSION}"
-
-      - name: Verify Boomi Authentication and Process
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=========================================="
-          echo "STEP 2 - Verify Boomi process"
-          echo "=========================================="
-
-          AUTH_USER="BOOMI_TOKEN.${BOOMI_USERNAME}"
-
-          HTTP_CODE="$(
-            curl -sS \
-              -o component_response.json \
-              -w "%{http_code}" \
-              -u "${AUTH_USER}:${BOOMI_API_TOKEN}" \
-              -H "Accept: application/json" \
-              "${API_ROOT}/ComponentMetadata/${BOOMI_COMPONENT_ID}"
-          )"
-
-          echo "ComponentMetadata HTTP Status: ${HTTP_CODE}"
-
-          if (( HTTP_CODE < 200 || HTTP_CODE >= 300 )); then
-            echo "ERROR: Unable to retrieve Boomi component."
-            cat component_response.json || true
-            exit 1
-          fi
-
-          COMPONENT_NAME="$(jq -r '.name // empty' component_response.json)"
-          COMPONENT_TYPE="$(jq -r '.type // empty' component_response.json)"
-          COMPONENT_REVISION="$(jq -r '.version // empty' component_response.json)"
-
-          echo "Manifest Process   : ${PROCESS_NAME}"
-          echo "Boomi Component    : ${COMPONENT_NAME}"
-          echo "Component Type     : ${COMPONENT_TYPE}"
-          echo "Component Revision : ${COMPONENT_REVISION}"
-
-          if [[ "${COMPONENT_NAME}" != "${PROCESS_NAME}" ]]; then
-            echo "ERROR: BOOMI_COMPONENT_ID belongs to a different process."
-            echo "Manifest process : ${PROCESS_NAME}"
-            echo "Boomi process    : ${COMPONENT_NAME}"
-            exit 1
-          fi
-
-          if [[ "${COMPONENT_TYPE}" != "process" ]]; then
-            echo "ERROR: Component is not a Boomi process."
-            exit 1
-          fi
-
-          echo "BOOMI_REVISION=${COMPONENT_REVISION}" >> "${GITHUB_ENV}"
-
-          echo "Boomi process verification successful."
-
-      - name: Create Boomi Packaged Component
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=========================================="
-          echo "STEP 3 - Create packaged component"
-          echo "=========================================="
-
-          AUTH_USER="BOOMI_TOKEN.${BOOMI_USERNAME}"
-
-          jq -n \
-            --arg componentId "${BOOMI_COMPONENT_ID}" \
-            --arg packageVersion "${PACKAGE_VERSION}" \
-            --arg notes "GitHub Actions automatic package for ${PROCESS_NAME}. Release ${RELEASE}. Run ${GITHUB_RUN_ID}." \
-            '{
-              componentId: $componentId,
-              packageVersion: $packageVersion,
-              notes: $notes
-            }' > package_request.json
-
-          HTTP_CODE="$(
-            curl -sS \
-              -o package_response.json \
-              -w "%{http_code}" \
-              -u "${AUTH_USER}:${BOOMI_API_TOKEN}" \
-              -H "Accept: application/json" \
-              -H "Content-Type: application/json" \
-              -X POST \
-              "${API_ROOT}/PackagedComponent" \
-              --data @package_request.json
-          )"
-
-          echo "PackagedComponent HTTP Status: ${HTTP_CODE}"
-
-          jq . package_response.json || cat package_response.json
-
-          if (( HTTP_CODE < 200 || HTTP_CODE >= 300 )); then
-            echo "ERROR: Packaged component creation failed."
-            exit 1
-          fi
-
-          PACKAGE_ID="$(jq -r '.packageId // empty' package_response.json)"
-          CREATED_PACKAGE_VERSION="$(jq -r '.packageVersion // empty' package_response.json)"
-          PACKAGED_COMPONENT_REVISION="$(jq -r '.componentVersion // empty' package_response.json)"
-
-          if [[ -z "${PACKAGE_ID}" ]]; then
-            echo "ERROR: packageId was not returned."
-            exit 1
-          fi
-
-          echo "PACKAGE_ID=${PACKAGE_ID}" >> "${GITHUB_ENV}"
-          echo "PACKAGED_COMPONENT_REVISION=${PACKAGED_COMPONENT_REVISION}" >> "${GITHUB_ENV}"
-
-          echo "Package created successfully."
-          echo "Process            : ${PROCESS_NAME}"
-          echo "Package ID         : ${PACKAGE_ID}"
-          echo "Package Version    : ${CREATED_PACKAGE_VERSION}"
-          echo "Component Revision : ${PACKAGED_COMPONENT_REVISION}"
-
-      - name: Deploy Package to Test Environment
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=========================================="
-          echo "STEP 4 - Deploy package to Test"
-          echo "=========================================="
-
-          AUTH_USER="BOOMI_TOKEN.${BOOMI_USERNAME}"
-
-          jq -n \
-            --arg environmentId "${BOOMI_ENVIRONMENT_ID}" \
-            --arg packageId "${PACKAGE_ID}" \
-            --arg notes "GitHub Actions automatic deployment for ${PROCESS_NAME}. Release ${RELEASE}." \
-            '{
-              environmentId: $environmentId,
-              packageId: $packageId,
-              notes: $notes
-            }' > deployment_request.json
-
-          HTTP_CODE="$(
-            curl -sS \
-              -o deployment_response.json \
-              -w "%{http_code}" \
-              -u "${AUTH_USER}:${BOOMI_API_TOKEN}" \
-              -H "Accept: application/json" \
-              -H "Content-Type: application/json" \
-              -X POST \
-              "${API_ROOT}/DeployedPackage" \
-              --data @deployment_request.json
-          )"
-
-          echo "DeployedPackage HTTP Status: ${HTTP_CODE}"
-
-          jq . deployment_response.json || cat deployment_response.json
-
-          if (( HTTP_CODE < 200 || HTTP_CODE >= 300 )); then
-            echo "ERROR: Deployment failed."
-            exit 1
-          fi
-
-          DEPLOYMENT_ID="$(jq -r '.deploymentId // empty' deployment_response.json)"
-          DEPLOYMENT_PACKAGE_ID="$(jq -r '.packageId // empty' deployment_response.json)"
-          DEPLOYMENT_ENVIRONMENT_ID="$(jq -r '.environmentId // empty' deployment_response.json)"
-          DEPLOYMENT_ACTIVE="$(jq -r '.active // false' deployment_response.json)"
-
-          if [[ -z "${DEPLOYMENT_ID}" ]]; then
-            echo "ERROR: deploymentId was not returned."
-            exit 1
-          fi
-
-          if [[ "${DEPLOYMENT_PACKAGE_ID}" != "${PACKAGE_ID}" ]]; then
-            echo "ERROR: Package ID mismatch."
-            exit 1
-          fi
-
-          if [[ "${DEPLOYMENT_ENVIRONMENT_ID}" != "${BOOMI_ENVIRONMENT_ID}" ]]; then
-            echo "ERROR: Environment ID mismatch."
-            exit 1
-          fi
-
-          if [[ "${DEPLOYMENT_ACTIVE}" != "true" ]]; then
-            echo "ERROR: Deployment is not active."
-            exit 1
-          fi
-
-          echo "DEPLOYMENT_ID=${DEPLOYMENT_ID}" >> "${GITHUB_ENV}"
-
-          echo "Deployment completed successfully."
-          echo "Process       : ${PROCESS_NAME}"
-          echo "Deployment ID: ${DEPLOYMENT_ID}"
-          echo "Active       : ${DEPLOYMENT_ACTIVE}"
-
-      - name: Verify Active Boomi Deployment
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=========================================="
-          echo "STEP 5 - Verify active deployment"
-          echo "=========================================="
-
-          AUTH_USER="BOOMI_TOKEN.${BOOMI_USERNAME}"
-
-          HTTP_CODE="$(
-            curl -sS \
-              -o deployment_verify.json \
-              -w "%{http_code}" \
-              -u "${AUTH_USER}:${BOOMI_API_TOKEN}" \
-              -H "Accept: application/json" \
-              "${API_ROOT}/DeployedPackage/${DEPLOYMENT_ID}"
-          )"
-
-          echo "Deployment verification HTTP Status: ${HTTP_CODE}"
-
-          if [[ "${HTTP_CODE}" != "200" ]]; then
-            echo "ERROR: Unable to retrieve deployment."
-            cat deployment_verify.json || true
-            exit 1
-          fi
-
-          VERIFY_ACTIVE="$(jq -r '.active // false' deployment_verify.json)"
-          VERIFY_PACKAGE_ID="$(jq -r '.packageId // empty' deployment_verify.json)"
-          VERIFY_ENVIRONMENT_ID="$(jq -r '.environmentId // empty' deployment_verify.json)"
-          VERIFY_COMPONENT_ID="$(jq -r '.componentId // empty' deployment_verify.json)"
-
-          if [[ "${VERIFY_ACTIVE}" != "true" ]]; then
-            echo "ERROR: Deployment is not active."
-            exit 1
-          fi
-
-          if [[ "${VERIFY_PACKAGE_ID}" != "${PACKAGE_ID}" ]]; then
-            echo "ERROR: Package verification failed."
-            exit 1
-          fi
-
-          if [[ "${VERIFY_ENVIRONMENT_ID}" != "${BOOMI_ENVIRONMENT_ID}" ]]; then
-            echo "ERROR: Environment verification failed."
-            exit 1
-          fi
-
-          if [[ "${VERIFY_COMPONENT_ID}" != "${BOOMI_COMPONENT_ID}" ]]; then
-            echo "ERROR: Component verification failed."
-            exit 1
-          fi
-
-          echo "Active deployment verification successful."
-
-      - name: Wait for Deployment to Reach Runtime
-        shell: bash
-        run: |
-          echo "=========================================="
-          echo "STEP 6 - Wait for runtime propagation"
-          echo "=========================================="
-
-          echo "Waiting 30 seconds..."
-          sleep 30
-
-      - name: Execute Deployed Boomi Process
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=========================================="
-          echo "STEP 7 - Execute ${PROCESS_NAME}"
-          echo "=========================================="
-
-          AUTH_USER="BOOMI_TOKEN.${BOOMI_USERNAME}"
-
-          jq -n \
-            --arg atomId "${BOOMI_ATOM_ID}" \
-            --arg processId "${BOOMI_COMPONENT_ID}" \
-            '{
-              "@type": "ExecutionRequest",
-              atomId: $atomId,
-              processId: $processId,
-              DynamicProcessProperties: {
-                DynamicProcessProperty: []
-              },
-              ProcessProperties: {
-                ProcessProperty: []
+            awk -F/ '
+              NF >= 3 && $1 == "boomi-components" {
+                print $1 "/" $2
               }
-            }' > execution_request.json
-
-          EXECUTION_SUBMITTED="false"
-
-          for ATTEMPT in $(seq 1 8); do
-
-            echo "Execution request attempt ${ATTEMPT}/8"
-
-            HTTP_CODE="$(
-              curl -sS \
-                -o execution_response.json \
-                -w "%{http_code}" \
-                -u "${AUTH_USER}:${BOOMI_API_TOKEN}" \
-                -H "Accept: application/json" \
-                -H "Content-Type: application/json" \
-                -X POST \
-                "${API_ROOT}/ExecutionRequest" \
-                --data @execution_request.json
-            )"
-
-            echo "ExecutionRequest HTTP Status: ${HTTP_CODE}"
-
-            if (( HTTP_CODE >= 200 && HTTP_CODE < 300 )); then
-              EXECUTION_SUBMITTED="true"
-              break
-            fi
-
-            if [[ "${HTTP_CODE}" == "401" || "${HTTP_CODE}" == "403" ]]; then
-              echo "ERROR: Authentication or Execute privilege failure."
-              cat execution_response.json || true
-              exit 1
-            fi
-
-            echo "Deployment may still be propagating."
-            cat execution_response.json || true
-            echo "Waiting 15 seconds..."
-            sleep 15
-          done
-
-          if [[ "${EXECUTION_SUBMITTED}" != "true" ]]; then
-            echo "ERROR: ExecutionRequest failed after all retries."
-            exit 1
-          fi
-
-          jq . execution_response.json || cat execution_response.json
-
-          REQUEST_ID="$(jq -r '.requestId // empty' execution_response.json)"
-
-          if [[ -z "${REQUEST_ID}" ]]; then
-            echo "ERROR: requestId was not returned."
-            exit 1
-          fi
-
-          echo "REQUEST_ID=${REQUEST_ID}" >> "${GITHUB_ENV}"
-
-          echo "Execution request submitted."
-          echo "Process   : ${PROCESS_NAME}"
-          echo "Request ID: ${REQUEST_ID}"
-
-      - name: Wait for Boomi Execution Result
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=========================================="
-          echo "STEP 8 - Poll execution result"
-          echo "=========================================="
-
-          AUTH_USER="BOOMI_TOKEN.${BOOMI_USERNAME}"
-
-          EXECUTION_SUCCESS="false"
-          FINAL_STATUS=""
-          EXECUTION_ID=""
-          RETURNED_PROCESS_NAME=""
-          RETURNED_ATOM_NAME=""
-
-          for ATTEMPT in $(seq 1 36); do
-
-            echo "Execution check ${ATTEMPT}/36"
-
-            HTTP_CODE="$(
-              curl -sS \
-                -o execution_record_response.json \
-                -w "%{http_code}" \
-                -u "${AUTH_USER}:${BOOMI_API_TOKEN}" \
-                -H "Accept: application/json" \
-                "${API_ROOT}/ExecutionRecord/async/${REQUEST_ID}"
-            )"
-
-            echo "ExecutionRecord HTTP Status: ${HTTP_CODE}"
-
-            if [[ "${HTTP_CODE}" == "202" ]]; then
-              echo "Execution record is not available yet."
-              sleep 10
-              continue
-            fi
-
-            if [[ "${HTTP_CODE}" != "200" ]]; then
-              echo "ERROR: Unable to retrieve ExecutionRecord."
-              cat execution_record_response.json || true
-              exit 1
-            fi
-
-            echo "Boomi response:"
-            jq . execution_record_response.json
-
-            STATUS="$(
-              jq -r '
-                (.result[0] // .).status // empty
-              ' execution_record_response.json
-            )"
-
-            EXECUTION_ID="$(
-              jq -r '
-                (.result[0] // .).executionId // empty
-              ' execution_record_response.json
-            )"
-
-            RETURNED_PROCESS_NAME="$(
-              jq -r '
-                (.result[0] // .).processName // empty
-              ' execution_record_response.json
-            )"
-
-            RETURNED_PROCESS_ID="$(
-              jq -r '
-                (.result[0] // .).processId // empty
-              ' execution_record_response.json
-            )"
-
-            RETURNED_ATOM_NAME="$(
-              jq -r '
-                (.result[0] // .).atomName // empty
-              ' execution_record_response.json
-            )"
-
-            RETURNED_ATOM_ID="$(
-              jq -r '
-                (.result[0] // .).atomId // empty
-              ' execution_record_response.json
-            )"
-
-            MESSAGE="$(
-              jq -r '
-                (.result[0] // .).message // empty
-              ' execution_record_response.json
-            )"
-
-            echo "=========================================="
-            echo "NORMALIZED EXECUTION RECORD"
-            echo "=========================================="
-            echo "Process Name : ${RETURNED_PROCESS_NAME}"
-            echo "Runtime Name : ${RETURNED_ATOM_NAME}"
-            echo "Execution ID : ${EXECUTION_ID}"
-            echo "Status       : ${STATUS}"
-            echo "=========================================="
-
-            if [[ -z "${STATUS}" ]]; then
-              echo "Execution status not available yet."
-              sleep 10
-              continue
-            fi
-
-            if [[ -z "${RETURNED_PROCESS_ID}" ]]; then
-              echo "ERROR: processId was not returned."
-              exit 1
-            fi
-
-            if [[ "${RETURNED_PROCESS_ID}" != "${BOOMI_COMPONENT_ID}" ]]; then
-              echo "ERROR: Execution process ID does not match."
-              exit 1
-            fi
-
-            if [[ -z "${RETURNED_ATOM_ID}" ]]; then
-              echo "ERROR: atomId was not returned."
-              exit 1
-            fi
-
-            if [[ "${RETURNED_ATOM_ID}" != "${BOOMI_ATOM_ID}" ]]; then
-              echo "ERROR: Execution runtime ID does not match."
-              exit 1
-            fi
-
-            if [[ "${RETURNED_PROCESS_NAME}" != "${PROCESS_NAME}" ]]; then
-              echo "ERROR: Execution process name does not match manifest."
-              echo "Expected : ${PROCESS_NAME}"
-              echo "Actual   : ${RETURNED_PROCESS_NAME}"
-              exit 1
-            fi
-
-            case "${STATUS}" in
-
-              COMPLETE|COMPLETE_WARN)
-                EXECUTION_SUCCESS="true"
-                FINAL_STATUS="${STATUS}"
-                break
-                ;;
-
-              ERROR|ABORTED|ABORTED_RECOVERING|DISCARDED)
-                echo "ERROR: Boomi execution failed."
-                echo "Status : ${STATUS}"
-                echo "Message: ${MESSAGE}"
-                exit 1
-                ;;
-
-              ENQUEUED|INPROCESS|STARTED|"")
-                echo "Process is still running."
-                sleep 10
-                ;;
-
-              *)
-                echo "Current execution status: ${STATUS}"
-                sleep 10
-                ;;
-            esac
-
-          done
-
-          if [[ "${EXECUTION_SUCCESS}" != "true" ]]; then
-            echo "ERROR: Timed out waiting for process completion."
-            exit 1
+            ' changed-files.txt \
+            | sort -u \
+            > changed-processes.txt
           fi
 
           echo ""
-          echo "=========================================="
-          echo "BOOMI CI/CD DEMO COMPLETED SUCCESSFULLY"
-          echo "=========================================="
-          echo "Process          : ${RETURNED_PROCESS_NAME}"
-          echo "Runtime          : ${RETURNED_ATOM_NAME}"
-          echo "Release          : ${RELEASE}"
-          echo "Boomi Revision   : ${PACKAGED_COMPONENT_REVISION}"
-          echo "Package Version  : ${PACKAGE_VERSION}"
-          echo "Package ID       : ${PACKAGE_ID}"
-          echo "Deployment ID    : ${DEPLOYMENT_ID}"
-          echo "Execution ID     : ${EXECUTION_ID}"
-          echo "Execution Status : ${FINAL_STATUS}"
-          echo "=========================================="
+          echo "Changed processes:"
+          cat changed-processes.txt
 
-          {
-            echo "# Boomi CI/CD Deployment Successful"
+      - name: Deploy Changed Processes
+        if: hashFiles('changed-processes.txt') != ''
+        env:
+          BOOMI_API_BASE_URL: ${{ secrets.BOOMI_API_BASE_URL }}
+          BOOMI_ACCOUNT_ID: ${{ secrets.BOOMI_ACCOUNT_ID }}
+          BOOMI_USERNAME: ${{ secrets.BOOMI_USERNAME }}
+          BOOMI_API_TOKEN: ${{ secrets.BOOMI_API_TOKEN }}
+          BOOMI_ENVIRONMENT_ID: ${{ secrets.BOOMI_ENVIRONMENT_ID }}
+        run: |
+          set -e
+
+          if [[ "${BOOMI_USERNAME}" == BOOMI_TOKEN.* ]]; then
+            BOOMI_AUTH_USER="${BOOMI_USERNAME}"
+          else
+            BOOMI_AUTH_USER="BOOMI_TOKEN.${BOOMI_USERNAME}"
+          fi
+
+          while IFS= read -r PROCESS_DIR; do
+
+            COMPONENT_ID=$(basename "$PROCESS_DIR")
+
+            PROCESS_NAME="Unknown"
+
+            if [ -f "$PROCESS_DIR/component-name.txt" ]; then
+              PROCESS_NAME=$(cat "$PROCESS_DIR/component-name.txt")
+            fi
+
+            VERSION="Unknown"
+
+            if [ -f "$PROCESS_DIR/version.txt" ]; then
+              VERSION=$(cat "$PROCESS_DIR/version.txt")
+            fi
+
             echo ""
-            echo "| Item | Result |"
-            echo "|---|---|"
-            echo "| Process | ${RETURNED_PROCESS_NAME} |"
-            echo "| Runtime | ${RETURNED_ATOM_NAME} |"
-            echo "| Release | ${RELEASE} |"
-            echo "| Boomi Revision | ${PACKAGED_COMPONENT_REVISION} |"
-            echo "| Package Version | ${PACKAGE_VERSION} |"
-            echo "| Package ID | ${PACKAGE_ID} |"
-            echo "| Deployment ID | ${DEPLOYMENT_ID} |"
-            echo "| Execution ID | ${EXECUTION_ID} |"
-            echo "| Execution Status | ${FINAL_STATUS} |"
-          } >> "${GITHUB_STEP_SUMMARY}"
+            echo "======================================"
+            echo "Deploying Boomi Process"
+            echo "======================================"
+            echo "Process   : $PROCESS_NAME"
+            echo "Component : $COMPONENT_ID"
+            echo "Revision  : $VERSION"
+            echo "Environment: $BOOMI_ENVIRONMENT_ID"
+            echo "======================================"
+
+            RESPONSE=$(curl \
+              --silent \
+              --show-error \
+              --fail-with-body \
+              --user "${BOOMI_AUTH_USER}:${BOOMI_API_TOKEN}" \
+              --header "Accept: application/json" \
+              --header "Content-Type: application/json" \
+              --request POST \
+              --data "{
+                \"environmentId\": \"${BOOMI_ENVIRONMENT_ID}\",
+                \"componentId\": \"${COMPONENT_ID}\",
+                \"notes\": \"GitHub Actions deployment - ${PROCESS_NAME} - revision ${VERSION}\"
+              }" \
+              "${BOOMI_API_BASE_URL}/${BOOMI_ACCOUNT_ID}/DeployedPackage")
+
+            echo ""
+            echo "Boomi deployment response:"
+            echo "$RESPONSE"
+
+            echo "$RESPONSE" > \
+              "${PROCESS_DIR}/deployment-response.json"
+
+            echo ""
+            echo "Deployment completed for:"
+            echo "$PROCESS_NAME"
+
+          done < changed-processes.txt
+
+      - name: Deployment Summary
+        run: |
+          echo "## Boomi Deployment Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f changed-processes.txt ]; then
+            echo "| Process | Component ID |" >> "$GITHUB_STEP_SUMMARY"
+            echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+
+            while IFS= read -r PROCESS_DIR; do
+
+              COMPONENT_ID=$(basename "$PROCESS_DIR")
+
+              if [ -f "$PROCESS_DIR/component-name.txt" ]; then
+                PROCESS_NAME=$(cat "$PROCESS_DIR/component-name.txt")
+              else
+                PROCESS_NAME="Unknown"
+              fi
+
+              echo "| $PROCESS_NAME | $COMPONENT_ID |" \
+                >> "$GITHUB_STEP_SUMMARY"
+
+            done < changed-processes.txt
+          else
+            echo "No Boomi process changes detected." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
