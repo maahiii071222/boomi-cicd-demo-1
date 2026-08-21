@@ -1,0 +1,126 @@
+name: Sync Boomi Changes to GitHub
+
+on:
+  schedule:
+    # Check Boomi every 5 minutes
+    - cron: "*/5 * * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-boomi:
+    name: Export Boomi Process
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Get Latest Boomi Component
+        env:
+          BOOMI_API_BASE_URL: ${{ secrets.BOOMI_API_BASE_URL }}
+          BOOMI_ACCOUNT_ID: ${{ secrets.BOOMI_ACCOUNT_ID }}
+          BOOMI_USERNAME: ${{ secrets.BOOMI_USERNAME }}
+          BOOMI_API_TOKEN: ${{ secrets.BOOMI_API_TOKEN }}
+          BOOMI_COMPONENT_ID: ${{ secrets.BOOMI_COMPONENT_ID }}
+        run: |
+          set -e
+
+          echo "Checking Boomi component..."
+          echo "Component ID: ${BOOMI_COMPONENT_ID}"
+
+          # Boomi API-token authentication requires:
+          # BOOMI_TOKEN.<username> : <token>
+
+          if [[ "${BOOMI_USERNAME}" == BOOMI_TOKEN.* ]]; then
+            BOOMI_AUTH_USER="${BOOMI_USERNAME}"
+          else
+            BOOMI_AUTH_USER="BOOMI_TOKEN.${BOOMI_USERNAME}"
+          fi
+
+          mkdir -p boomi-components
+
+          curl --silent \
+               --show-error \
+               --fail \
+               --user "${BOOMI_AUTH_USER}:${BOOMI_API_TOKEN}" \
+               --header "Accept: application/xml" \
+               --request GET \
+               "${BOOMI_API_BASE_URL}/${BOOMI_ACCOUNT_ID}/Component/${BOOMI_COMPONENT_ID}" \
+               --output boomi-components/process.xml
+
+          echo "Boomi component downloaded."
+
+      - name: Extract Boomi Revision
+        run: |
+          set -e
+
+          python3 <<'PY'
+          import xml.etree.ElementTree as ET
+
+          file = "boomi-components/process.xml"
+
+          root = ET.parse(file).getroot()
+
+          version = root.attrib.get("version", "unknown")
+          component_id = root.attrib.get("componentId", "unknown")
+          name = root.attrib.get("name", "unknown")
+          component_type = root.attrib.get("type", "unknown")
+
+          print("Component ID :", component_id)
+          print("Component Name:", name)
+          print("Component Type:", component_type)
+          print("Revision      :", version)
+
+          with open("boomi-components/version.txt", "w") as f:
+              f.write(version)
+
+          with open("boomi-components/component-name.txt", "w") as f:
+              f.write(name)
+          PY
+
+      - name: Check for Changes
+        id: changes
+        run: |
+          if git diff --quiet -- boomi-components/; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No Boomi changes detected."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Boomi changes detected."
+          fi
+
+      - name: Commit Boomi Changes
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          git config user.name "Boomi CI/CD Bot"
+          git config user.email "boomi-cicd-bot@users.noreply.github.com"
+
+          git add boomi-components/
+
+          git commit \
+            -m "chore: sync Boomi process revision $(cat boomi-components/version.txt)"
+
+          git push origin main
+
+      - name: No Changes
+        if: steps.changes.outputs.changed == 'false'
+        run: |
+          echo "Boomi process has not changed."
+          echo "No GitHub commit created."
+
+      - name: Summary
+        run: |
+          echo "## Boomi Synchronization" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Component | ${{ secrets.BOOMI_COMPONENT_ID }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Revision | $(cat boomi-components/version.txt) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Status | Sync completed |" >> "$GITHUB_STEP_SUMMARY"
