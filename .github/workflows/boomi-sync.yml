@@ -1,8 +1,7 @@
-name: Sync Boomi Changes to GitHub
+name: Sync All Boomi Processes
 
 on:
   schedule:
-    # Check Boomi every 5 minutes
     - cron: "*/5 * * * *"
 
   workflow_dispatch:
@@ -12,7 +11,7 @@ permissions:
 
 jobs:
   sync-boomi:
-    name: Export Boomi Process
+    name: Discover and Sync Boomi Processes
     runs-on: ubuntu-latest
 
     steps:
@@ -22,105 +21,313 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GH_PAT }}
 
-      - name: Get Latest Boomi Component
+      - name: Install Dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          pip install requests
+
+      - name: Discover All Boomi Processes
         env:
           BOOMI_API_BASE_URL: ${{ secrets.BOOMI_API_BASE_URL }}
           BOOMI_ACCOUNT_ID: ${{ secrets.BOOMI_ACCOUNT_ID }}
           BOOMI_USERNAME: ${{ secrets.BOOMI_USERNAME }}
           BOOMI_API_TOKEN: ${{ secrets.BOOMI_API_TOKEN }}
-          BOOMI_COMPONENT_ID: ${{ secrets.BOOMI_COMPONENT_ID }}
-        run: |
-          set -e
-
-          echo "Checking Boomi component..."
-          echo "Component ID: ${BOOMI_COMPONENT_ID}"
-
-          # Boomi API-token authentication requires:
-          # BOOMI_TOKEN.<username> : <token>
-
-          if [[ "${BOOMI_USERNAME}" == BOOMI_TOKEN.* ]]; then
-            BOOMI_AUTH_USER="${BOOMI_USERNAME}"
-          else
-            BOOMI_AUTH_USER="BOOMI_TOKEN.${BOOMI_USERNAME}"
-          fi
-
-          mkdir -p boomi-components
-
-          curl --silent \
-               --show-error \
-               --fail \
-               --user "${BOOMI_AUTH_USER}:${BOOMI_API_TOKEN}" \
-               --header "Accept: application/xml" \
-               --request GET \
-               "${BOOMI_API_BASE_URL}/${BOOMI_ACCOUNT_ID}/Component/${BOOMI_COMPONENT_ID}" \
-               --output boomi-components/process.xml
-
-          echo "Boomi component downloaded."
-
-      - name: Extract Boomi Revision
         run: |
           set -e
 
           python3 <<'PY'
-          import xml.etree.ElementTree as ET
+          import json
+          import os
+          import requests
+          import sys
 
-          file = "boomi-components/process.xml"
+          BASE_URL = os.environ["BOOMI_API_BASE_URL"].rstrip("/")
+          ACCOUNT_ID = os.environ["BOOMI_ACCOUNT_ID"]
+          USERNAME = os.environ["BOOMI_USERNAME"]
+          TOKEN = os.environ["BOOMI_API_TOKEN"]
 
-          root = ET.parse(file).getroot()
+          if USERNAME.startswith("BOOMI_TOKEN."):
+              AUTH_USER = USERNAME
+          else:
+              AUTH_USER = f"BOOMI_TOKEN.{USERNAME}"
 
-          version = root.attrib.get("version", "unknown")
-          component_id = root.attrib.get("componentId", "unknown")
-          name = root.attrib.get("name", "unknown")
-          component_type = root.attrib.get("type", "unknown")
+          URL = f"{BASE_URL}/{ACCOUNT_ID}/ComponentMetadata/query"
 
-          print("Component ID :", component_id)
-          print("Component Name:", name)
-          print("Component Type:", component_type)
-          print("Revision      :", version)
+          headers = {
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+          }
 
-          with open("boomi-components/version.txt", "w") as f:
-              f.write(version)
+          query = {
+              "QueryFilter": {
+                  "expression": {
+                      "operator": "and",
+                      "nestedExpression": [
+                          {
+                              "operator": "EQUALS",
+                              "property": "currentVersion",
+                              "argument": ["true"]
+                          },
+                          {
+                              "operator": "EQUALS",
+                              "property": "deleted",
+                              "argument": ["false"]
+                          },
+                          {
+                              "operator": "EQUALS",
+                              "property": "type",
+                              "argument": ["process"]
+                          }
+                      ]
+                  }
+              }
+          }
 
-          with open("boomi-components/component-name.txt", "w") as f:
-              f.write(name)
+          print("Querying all current Boomi processes...")
+
+          response = requests.post(
+              URL,
+              auth=(AUTH_USER, TOKEN),
+              headers=headers,
+              json=query,
+              timeout=60
+          )
+
+          if response.status_code != 200:
+              print(response.text)
+              sys.exit(
+                  f"Boomi API failed with HTTP {response.status_code}"
+              )
+
+          data = response.json()
+
+          processes = data.get("result", [])
+
+          query_token = data.get("queryToken")
+
+          while query_token:
+              more_url = f"{BASE_URL}/{ACCOUNT_ID}/ComponentMetadata/queryMore"
+
+              response = requests.post(
+                  more_url,
+                  auth=(AUTH_USER, TOKEN),
+                  headers={
+                      "Accept": "application/json",
+                      "Content-Type": "text/plain"
+                  },
+                  data=query_token,
+                  timeout=60
+              )
+
+              if response.status_code != 200:
+                  print(response.text)
+                  sys.exit(
+                      f"Boomi queryMore failed with HTTP {response.status_code}"
+                  )
+
+              more_data = response.json()
+
+              processes.extend(more_data.get("result", []))
+
+              query_token = more_data.get("queryToken")
+
+          os.makedirs("boomi-components", exist_ok=True)
+
+          discovered = {}
+
+          for process in processes:
+
+              component_id = process.get("componentId")
+              version = process.get("version")
+              name = process.get("name")
+              modified_date = process.get("modifiedDate")
+              folder_name = process.get("folderName")
+
+              if not component_id:
+                  continue
+
+              discovered[component_id] = {
+                  "componentId": component_id,
+                  "name": name,
+                  "version": version,
+                  "modifiedDate": modified_date,
+                  "folderName": folder_name,
+                  "type": process.get("type")
+              }
+
+          with open(
+              "boomi-components/index.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  discovered,
+                  f,
+                  indent=2,
+                  sort_keys=True
+              )
+
+          print("")
+          print("======================================")
+          print(f"Processes discovered: {len(discovered)}")
+          print("======================================")
+
+          for component_id, process in sorted(discovered.items()):
+              print(
+                  f"{process['name']} | "
+                  f"{component_id} | "
+                  f"Revision {process['version']}"
+              )
           PY
 
-      - name: Check for Changes
-        id: changes
+      - name: Export New and Changed Processes
+        env:
+          BOOMI_API_BASE_URL: ${{ secrets.BOOMI_API_BASE_URL }}
+          BOOMI_ACCOUNT_ID: ${{ secrets.BOOMI_ACCOUNT_ID }}
+          BOOMI_USERNAME: ${{ secrets.BOOMI_USERNAME }}
+          BOOMI_API_TOKEN: ${{ secrets.BOOMI_API_TOKEN }}
         run: |
-          if git diff --quiet -- boomi-components/; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No Boomi changes detected."
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "Boomi changes detected."
-          fi
+          set -e
+
+          python3 <<'PY'
+          import json
+          import os
+          import pathlib
+          import requests
+          import xml.etree.ElementTree as ET
+
+          BASE_URL = os.environ["BOOMI_API_BASE_URL"].rstrip("/")
+          ACCOUNT_ID = os.environ["BOOMI_ACCOUNT_ID"]
+          USERNAME = os.environ["BOOMI_USERNAME"]
+          TOKEN = os.environ["BOOMI_API_TOKEN"]
+
+          if USERNAME.startswith("BOOMI_TOKEN."):
+              AUTH_USER = USERNAME
+          else:
+              AUTH_USER = f"BOOMI_TOKEN.{USERNAME}"
+
+          with open(
+              "boomi-components/index.json",
+              encoding="utf-8"
+          ) as f:
+              processes = json.load(f)
+
+          changed = []
+
+          for component_id, process in processes.items():
+
+              version = str(process["version"])
+
+              directory = pathlib.Path(
+                  "boomi-components"
+              ) / component_id
+
+              version_file = directory / "version.txt"
+              process_file = directory / "process.xml"
+
+              old_version = None
+
+              if version_file.exists():
+                  old_version = version_file.read_text().strip()
+
+              if old_version == version and process_file.exists():
+                  print(
+                      f"UNCHANGED: {process['name']} "
+                      f"(revision {version})"
+                  )
+                  continue
+
+              print(
+                  f"CHANGED/NEW: {process['name']} "
+                  f"(revision {version})"
+              )
+
+              directory.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
+
+              url = (
+                  f"{BASE_URL}/{ACCOUNT_ID}"
+                  f"/Component/{component_id}"
+              )
+
+              response = requests.get(
+                  url,
+                  auth=(AUTH_USER, TOKEN),
+                  headers={
+                      "Accept": "application/xml"
+                  },
+                  timeout=60
+              )
+
+              if response.status_code != 200:
+                  print(response.text)
+                  raise SystemExit(
+                      f"Failed to export {component_id}"
+                  )
+
+              process_file.write_bytes(response.content)
+
+              version_file.write_text(
+                  version,
+                  encoding="utf-8"
+              )
+
+              (directory / "component-name.txt").write_text(
+                  process["name"] or "",
+                  encoding="utf-8"
+              )
+
+              changed.append({
+                  "componentId": component_id,
+                  "name": process["name"],
+                  "version": version
+              })
+
+          with open(
+              "boomi-components/changed-processes.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(
+                  changed,
+                  f,
+                  indent=2
+              )
+
+          print("")
+          print("======================================")
+          print(f"New/changed processes: {len(changed)}")
+          print("======================================")
+
+          for item in changed:
+              print(
+                  f"{item['name']} | "
+                  f"{item['componentId']} | "
+                  f"Revision {item['version']}"
+              )
+          PY
 
       - name: Commit Boomi Changes
-        if: steps.changes.outputs.changed == 'true'
         run: |
           git config user.name "Boomi CI/CD Bot"
           git config user.email "boomi-cicd-bot@users.noreply.github.com"
 
           git add boomi-components/
 
+          if git diff --cached --quiet; then
+            echo "No Boomi changes detected."
+            exit 0
+          fi
+
           git commit \
-            -m "chore: sync Boomi process revision $(cat boomi-components/version.txt)"
+            -m "chore: sync Boomi processes"
 
           git push origin main
 
-      - name: No Changes
-        if: steps.changes.outputs.changed == 'false'
-        run: |
-          echo "Boomi process has not changed."
-          echo "No GitHub commit created."
-
       - name: Summary
         run: |
-          echo "## Boomi Synchronization" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Boomi Process Synchronization" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Item | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Component | ${{ secrets.BOOMI_COMPONENT_ID }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Revision | $(cat boomi-components/version.txt) |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Status | Sync completed |" >> "$GITHUB_STEP_SUMMARY"
+          echo "All current Boomi processes were checked." >> "$GITHUB_STEP_SUMMARY"
